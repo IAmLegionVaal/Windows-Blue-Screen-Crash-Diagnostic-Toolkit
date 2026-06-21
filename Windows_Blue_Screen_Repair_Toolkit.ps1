@@ -24,8 +24,9 @@ function Test-Administrator {
 }
 
 if ($env:OS -ne 'Windows_NT') { Write-Error 'This tool requires Windows.'; exit 3 }
-if (-not ($DumpType -or $EnableAutomaticPageFile -or $RepairSystemFiles -or $RestartWerService -or $null -ne $ArchiveMinidumpsOlderThanDays)) { Write-Error 'Choose at least one repair action.'; exit 2 }
-if ($null -ne $ArchiveMinidumpsOlderThanDays -and $ArchiveMinidumpsOlderThanDays -lt 0) { Write-Error 'Archive age must be zero or greater.'; exit 2 }
+$archiveRequested = $null -ne $ArchiveMinidumpsOlderThanDays
+if (-not ($DumpType -or $EnableAutomaticPageFile -or $RepairSystemFiles -or $RestartWerService -or $archiveRequested)) { Write-Error 'Choose at least one repair action.'; exit 2 }
+if ($archiveRequested -and [int]$ArchiveMinidumpsOlderThanDays -lt 0) { Write-Error 'Archive age must be zero or greater.'; exit 2 }
 if (-not $DryRun -and -not (Test-Administrator)) { Write-Error 'Run from an elevated PowerShell session.'; exit 4 }
 
 $crashControlPath = 'HKLM:\SYSTEM\CurrentControlSet\Control\CrashControl'
@@ -52,21 +53,23 @@ function Invoke-RepairAction([string]$Description,[scriptblock]$Script) {
         Write-Log "FAILED: $Description - $($_.Exception.Message)"
     }
 }
+function Get-CrashControlValue([string]$Name) {
+    try { Get-ItemPropertyValue -Path $crashControlPath -Name $Name -ErrorAction Stop } catch { $null }
+}
 function Get-RepairState {
-    $crash = Get-ItemProperty $crashControlPath
     $computer = Get-CimInstance Win32_ComputerSystem
     [pscustomobject]@{
         Collected = Get-Date
         CrashControl = [pscustomobject]@{
-            CrashDumpEnabled = $crash.CrashDumpEnabled
-            DumpFile = $crash.DumpFile
-            MinidumpDir = $crash.MinidumpDir
-            AlwaysKeepMemoryDump = $crash.AlwaysKeepMemoryDump
+            CrashDumpEnabled = Get-CrashControlValue 'CrashDumpEnabled'
+            DumpFile = Get-CrashControlValue 'DumpFile'
+            MinidumpDir = Get-CrashControlValue 'MinidumpDir'
+            AlwaysKeepMemoryDump = Get-CrashControlValue 'AlwaysKeepMemoryDump'
         }
         AutomaticManagedPagefile = $computer.AutomaticManagedPagefile
         PageFiles = @(Get-CimInstance Win32_PageFileSetting -ErrorAction SilentlyContinue | Select-Object Name,InitialSize,MaximumSize)
         WerService = Get-Service WerSvc -ErrorAction SilentlyContinue | Select-Object Name,Status,StartType
-        Minidumps = @(Get-ChildItem $minidumpPath -Filter '*.dmp' -ErrorAction SilentlyContinue | Select-Object Name,Length,CreationTime,LastWriteTime)
+        Minidumps = @(Get-ChildItem $minidumpPath -Filter '*.dmp' -File -ErrorAction SilentlyContinue | Select-Object Name,Length,CreationTime,LastWriteTime)
         RecentBugChecks = @(Get-WinEvent -FilterHashtable @{LogName='System';Id=1001;StartTime=(Get-Date).AddDays(-30)} -ErrorAction SilentlyContinue | Select-Object -First 20 TimeCreated,Id,ProviderName,Message)
     }
 }
@@ -107,10 +110,11 @@ if ($RestartWerService) {
         if ($service.Status -eq 'Running') { Restart-Service WerSvc -Force } else { Start-Service WerSvc }
     }
 }
-if ($null -ne $ArchiveMinidumpsOlderThanDays) {
-    Invoke-RepairAction "Archiving minidumps older than $ArchiveMinidumpsOlderThanDays day(s)" {
+if ($archiveRequested) {
+    $archiveAge = [int]$ArchiveMinidumpsOlderThanDays
+    Invoke-RepairAction "Archiving minidumps older than $archiveAge day(s)" {
         if (-not (Test-Path $minidumpPath)) { return }
-        $cutoff = (Get-Date).AddDays(-$ArchiveMinidumpsOlderThanDays.Value)
+        $cutoff = (Get-Date).AddDays(-$archiveAge)
         $files = @(Get-ChildItem $minidumpPath -Filter '*.dmp' -File -ErrorAction SilentlyContinue | Where-Object LastWriteTime -lt $cutoff)
         foreach ($file in $files) { Move-Item -LiteralPath $file.FullName -Destination $dumpArchivePath -Force }
         Write-Log "Archived minidumps: $($files.Count)"
@@ -121,12 +125,12 @@ if (-not $DryRun) { Start-Sleep -Seconds 2 }
 Get-RepairState | ConvertTo-Json -Depth 8 | Set-Content $afterPath -Encoding UTF8
 if ($DumpType) {
     $expected = @{ Automatic=7; Kernel=2; Small=3; Complete=1 }[$DumpType]
-    if ((Get-ItemProperty $crashControlPath).CrashDumpEnabled -ne $expected) { $script:VerificationFailures++; Write-Log 'VERIFY FAILED: crash dump type was not applied.' }
+    if ((Get-CrashControlValue 'CrashDumpEnabled') -ne $expected) { $script:VerificationFailures++; Write-Log 'VERIFY FAILED: crash dump type was not applied.' }
 }
 if ($EnableAutomaticPageFile -and -not (Get-CimInstance Win32_ComputerSystem).AutomaticManagedPagefile) { $script:VerificationFailures++; Write-Log 'VERIFY FAILED: automatic page-file management is not enabled.' }
-if ($RestartWerService -and (Get-Service WerSvc).Status -ne 'Running') { $script:VerificationFailures++; Write-Log 'VERIFY FAILED: WerSvc is not running.' }
-if ($null -ne $ArchiveMinidumpsOlderThanDays -and (Test-Path $minidumpPath)) {
-    $cutoff = (Get-Date).AddDays(-$ArchiveMinidumpsOlderThanDays.Value)
+if ($RestartWerService -and (Get-Service WerSvc).StartType -eq 'Disabled') { $script:VerificationFailures++; Write-Log 'VERIFY FAILED: WerSvc remains disabled.' }
+if ($archiveRequested -and (Test-Path $minidumpPath)) {
+    $cutoff = (Get-Date).AddDays(-[int]$ArchiveMinidumpsOlderThanDays)
     if (@(Get-ChildItem $minidumpPath -Filter '*.dmp' -File -ErrorAction SilentlyContinue | Where-Object LastWriteTime -lt $cutoff).Count -gt 0) { $script:VerificationFailures++; Write-Log 'VERIFY FAILED: eligible minidumps remain in the active directory.' }
 }
 
