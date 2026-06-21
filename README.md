@@ -2,53 +2,73 @@
 
 A PowerShell toolkit for collecting Windows crash and stability evidence and repairing selected crash-dump prerequisites.
 
-## Diagnostic script
+## Scripts
+
+- `Windows_Blue_Screen_Crash_Diagnostic_Toolkit.ps1` — read-only bugcheck, restart, minidump, driver, and system reporting.
+- `Windows_Blue_Screen_Repair_Toolkit.ps1` — guarded crash-dump, page-file, system-file, service, and minidump archival actions.
+
+## Repair actions
+
+The repair script supports:
+
+- `-DumpType Automatic|Kernel|Small|Complete` to configure future crash dumps and standard dump paths;
+- `-EnableAutomaticPageFile` to enable Windows-managed page-file sizing;
+- `-RepairSystemFiles` to run DISM RestoreHealth followed by System File Checker;
+- `-RestartWerService` to set Windows Error Reporting to Manual when disabled and then start or restart it;
+- `-ArchiveMinidumpsOlderThanDays <n>` to move explicitly aged minidumps into the run backup rather than delete them.
+
+It does not uninstall drivers, edit boot configuration, delete active dumps, deliberately trigger a bugcheck, or reboot the device. Some dump and page-file changes may require a restart before they fully affect future crashes.
+
+## Examples
+
+Preview dump and page-file changes:
 
 ```powershell
-powershell.exe -ExecutionPolicy Bypass -File .\Windows_Blue_Screen_Crash_Diagnostic_Toolkit.ps1
+powershell.exe -ExecutionPolicy Bypass -File .\Windows_Blue_Screen_Repair_Toolkit.ps1 `
+  -DumpType Automatic -EnableAutomaticPageFile -DryRun
 ```
 
-The diagnostic script reports recent bugchecks and restarts, minidumps, drivers and system context without changing the device.
-
-## Repair script
-
-Preview a dump configuration change:
+Apply selected recovery actions:
 
 ```powershell
-powershell.exe -ExecutionPolicy Bypass -File .\Windows_Blue_Screen_Repair_Toolkit.ps1 -DumpType Automatic -EnableAutomaticPageFile -DryRun
+powershell.exe -ExecutionPolicy Bypass -File .\Windows_Blue_Screen_Repair_Toolkit.ps1 `
+  -DumpType Kernel -EnableAutomaticPageFile `
+  -RepairSystemFiles -RestartWerService `
+  -ArchiveMinidumpsOlderThanDays 30 -Yes
 ```
 
-Examples:
+Omit `-Yes` to require typing `YES`. Actual changes require an elevated PowerShell session.
 
-```powershell
-.\Windows_Blue_Screen_Repair_Toolkit.ps1 -DumpType Automatic -EnableAutomaticPageFile
-.\Windows_Blue_Screen_Repair_Toolkit.ps1 -DumpType Small
-.\Windows_Blue_Screen_Repair_Toolkit.ps1 -RepairSystemFiles
-.\Windows_Blue_Screen_Repair_Toolkit.ps1 -RestartWerService
-.\Windows_Blue_Screen_Repair_Toolkit.ps1 -ArchiveMinidumpsOlderThanDays 30
-```
+## Evidence, backup, and verification
 
-## Repair behaviour
+Each run creates a timestamped directory under `%ProgramData%\BlueScreenRepair` unless `-OutputPath` is supplied. It contains:
 
-- Configures Automatic, Kernel, Small or Complete crash dumps.
-- Restores standard memory-dump and minidump paths and keeps the memory dump after restart.
-- Enables Windows automatic page-file management when requested.
-- Runs DISM RestoreHealth followed by System File Checker.
-- Starts or restarts Windows Error Reporting.
-- Moves explicitly aged minidumps into the run backup directory instead of deleting them.
-- Exports CrashControl registry and page-file evidence before changes.
-- Captures dump, page-file, service, minidump and recent bugcheck state before and after repair.
-- Supports `-DryRun`, confirmation prompts or `-Yes`, administrator checks, action logs and verification.
+- `before.json` and `after.json` with crash-control, page-file, WER service, minidump, and recent bugcheck state;
+- `repair.log` with planned actions, results, and verification failures;
+- for non-dry runs, `backup\CrashControl.reg` and `backup\pagefile-settings.xml`;
+- archived dump files under `backup\minidumps` when the archival action is selected.
 
-## Safety and exit codes
+Verification checks the requested dump type, automatic page-file setting, WER service state, and whether eligible old minidumps remain. DISM and SFC are validated from their process exit codes. `-DryRun` logs planned actions without changing the device, exporting configuration backups, moving dumps, or performing post-change verification.
 
-Dump-setting changes affect future crashes and some page-file changes take effect only after restart. System-file repair can take time. The tool does not delete current dumps, uninstall drivers, change boot configuration or reboot automatically.
+## Exit codes
 
-Exit codes: `0` success, `2` invalid arguments, `3` unsupported platform, `4` elevation required, `10` cancelled, `20` action failure and `30` verification failure.
+| Code | Meaning |
+|---:|---|
+| 0 | Completed successfully, including a successful dry run |
+| 2 | Invalid arguments |
+| 3 | Unsupported platform |
+| 4 | Elevation required |
+| 10 | User cancelled |
+| 20 | One or more repair actions or required backups failed |
+| 30 | Post-repair verification failed |
 
-## Validation note
+## Safety
 
-The repair script was committed and statically reviewed, but it was not runtime-tested on Windows or against an actual bugcheck.
+System-file repair can be lengthy and resource-intensive. Review storage capacity before selecting Complete or Kernel dumps, preserve collected evidence needed for investigations, and schedule disruptive work in an approved maintenance window.
+
+## Validation status
+
+The scripts were source-reviewed during this update. They were not runtime-tested on Windows or against an actual bugcheck.
 
 ## Author
 
