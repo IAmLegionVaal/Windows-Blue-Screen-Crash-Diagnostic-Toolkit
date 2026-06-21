@@ -39,7 +39,9 @@ $logPath = Join-Path $runPath 'repair.log'
 $beforePath = Join-Path $runPath 'before.json'
 $afterPath = Join-Path $runPath 'after.json'
 
-function Write-Log([string]$Message) { "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $Message" | Tee-Object -FilePath $logPath -Append }
+function Write-Log([string]$Message) {
+    "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $Message" | Tee-Object -FilePath $logPath -Append
+}
 function Invoke-RepairAction([string]$Description,[scriptblock]$Script) {
     $script:Actions++
     Write-Log "ACTION: $Description"
@@ -74,9 +76,15 @@ function Get-RepairState {
     }
 }
 
-Get-RepairState | ConvertTo-Json -Depth 8 | Set-Content $beforePath -Encoding UTF8
-& reg.exe export 'HKLM\SYSTEM\CurrentControlSet\Control\CrashControl' (Join-Path $backupPath 'CrashControl.reg') /y | Out-Null
-Get-CimInstance Win32_PageFileSetting -ErrorAction SilentlyContinue | Export-Clixml (Join-Path $backupPath 'pagefile-settings.xml')
+$beforeState = Get-RepairState
+$beforeState | ConvertTo-Json -Depth 8 | Set-Content $beforePath -Encoding UTF8
+
+if (-not $DryRun) {
+    & reg.exe export 'HKLM\SYSTEM\CurrentControlSet\Control\CrashControl' (Join-Path $backupPath 'CrashControl.reg') /y | Out-Null
+    if ($LASTEXITCODE -ne 0) { Write-Error 'Could not back up CrashControl registry settings.'; exit 20 }
+    Get-CimInstance Win32_PageFileSetting -ErrorAction SilentlyContinue | Export-Clixml (Join-Path $backupPath 'pagefile-settings.xml')
+    Write-Log "Saved pre-change backups to $backupPath"
+}
 
 if (-not $DryRun -and -not $Yes) {
     if ((Read-Host 'Apply the selected crash-diagnostics repairs? Type YES') -cne 'YES') { Write-Log 'Repair cancelled.'; exit 10 }
@@ -92,7 +100,9 @@ if ($DumpType) {
     }
 }
 if ($EnableAutomaticPageFile) {
-    Invoke-RepairAction 'Enabling automatic page-file management' { Get-CimInstance Win32_ComputerSystem | Set-CimInstance -Property @{AutomaticManagedPagefile=$true} | Out-Null }
+    Invoke-RepairAction 'Enabling automatic page-file management' {
+        Get-CimInstance Win32_ComputerSystem | Set-CimInstance -Property @{AutomaticManagedPagefile=$true} | Out-Null
+    }
 }
 if ($RepairSystemFiles) {
     Invoke-RepairAction 'Running DISM RestoreHealth' {
@@ -107,7 +117,8 @@ if ($RepairSystemFiles) {
 if ($RestartWerService) {
     Invoke-RepairAction 'Starting or restarting Windows Error Reporting service' {
         $service = Get-Service WerSvc -ErrorAction Stop
-        if ($service.Status -eq 'Running') { Restart-Service WerSvc -Force } else { Start-Service WerSvc }
+        if ($service.StartType -eq 'Disabled') { Set-Service WerSvc -StartupType Manual }
+        if ((Get-Service WerSvc).Status -eq 'Running') { Restart-Service WerSvc -Force } else { Start-Service WerSvc }
     }
 }
 if ($archiveRequested) {
@@ -122,19 +133,23 @@ if ($archiveRequested) {
 }
 
 if (-not $DryRun) { Start-Sleep -Seconds 2 }
-Get-RepairState | ConvertTo-Json -Depth 8 | Set-Content $afterPath -Encoding UTF8
-if ($DumpType) {
-    $expected = @{ Automatic=7; Kernel=2; Small=3; Complete=1 }[$DumpType]
-    if ((Get-CrashControlValue 'CrashDumpEnabled') -ne $expected) { $script:VerificationFailures++; Write-Log 'VERIFY FAILED: crash dump type was not applied.' }
-}
-if ($EnableAutomaticPageFile -and -not (Get-CimInstance Win32_ComputerSystem).AutomaticManagedPagefile) { $script:VerificationFailures++; Write-Log 'VERIFY FAILED: automatic page-file management is not enabled.' }
-if ($RestartWerService -and (Get-Service WerSvc).StartType -eq 'Disabled') { $script:VerificationFailures++; Write-Log 'VERIFY FAILED: WerSvc remains disabled.' }
-if ($archiveRequested -and (Test-Path $minidumpPath)) {
-    $cutoff = (Get-Date).AddDays(-[int]$ArchiveMinidumpsOlderThanDays)
-    if (@(Get-ChildItem $minidumpPath -Filter '*.dmp' -File -ErrorAction SilentlyContinue | Where-Object LastWriteTime -lt $cutoff).Count -gt 0) { $script:VerificationFailures++; Write-Log 'VERIFY FAILED: eligible minidumps remain in the active directory.' }
+$afterState = Get-RepairState
+$afterState | ConvertTo-Json -Depth 8 | Set-Content $afterPath -Encoding UTF8
+
+if (-not $DryRun) {
+    if ($DumpType) {
+        $expected = @{ Automatic=7; Kernel=2; Small=3; Complete=1 }[$DumpType]
+        if ($afterState.CrashControl.CrashDumpEnabled -ne $expected) { $script:VerificationFailures++; Write-Log 'VERIFY FAILED: crash dump type was not applied.' }
+    }
+    if ($EnableAutomaticPageFile -and -not $afterState.AutomaticManagedPagefile) { $script:VerificationFailures++; Write-Log 'VERIFY FAILED: automatic page-file management is not enabled.' }
+    if ($RestartWerService -and ($null -eq $afterState.WerService -or $afterState.WerService.Status -ne 'Running')) { $script:VerificationFailures++; Write-Log 'VERIFY FAILED: WerSvc is not running.' }
+    if ($archiveRequested -and (Test-Path $minidumpPath)) {
+        $cutoff = (Get-Date).AddDays(-[int]$ArchiveMinidumpsOlderThanDays)
+        if (@(Get-ChildItem $minidumpPath -Filter '*.dmp' -File -ErrorAction SilentlyContinue | Where-Object LastWriteTime -lt $cutoff).Count -gt 0) { $script:VerificationFailures++; Write-Log 'VERIFY FAILED: eligible minidumps remain in the active directory.' }
+    }
 }
 
 if ($script:Failures -gt 0) { exit 20 }
 if ($script:VerificationFailures -gt 0) { exit 30 }
-Write-Log "Repair completed. Actions: $script:Actions"
+Write-Log "Workflow completed. Actions: $script:Actions; DryRun: $DryRun"
 exit 0
